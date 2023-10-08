@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,51 +12,60 @@ var postsCount = posts.Count;
 
 var sw = Stopwatch.StartNew();
 
-// slower when int[] is used
-var tagMapTemp = new Dictionary<string, LinkedList<int>>(100);
+// Compute a bitmask that represents each tag that is used
+// TODO: this approach only works up until there are 30 unique tags
+Dictionary<string, int> tagIndexMap = new();
+uint[] postTagMasks = new uint[postsCount];
+int tagIndex = 0;
 
 for (var i = 0; i < postsCount; i++)
 {
     foreach (var tag in posts[i].Tags)
     {
-        // single lookup
-        ref var stack = ref CollectionsMarshal.GetValueRefOrAddDefault(tagMapTemp, tag, out _);
-        stack ??= new LinkedList<int>();
-        stack.AddLast(i);
+        ref int index = ref CollectionsMarshal.GetValueRefOrAddDefault(tagIndexMap, tag, out bool exists);
+        if (!exists)
+        {
+            index = ++tagIndex;
+        }
+        postTagMasks[i] |= (uint)(1 << index);
     }
 }
 
-var tagMap = new Dictionary<string, int[]>(tagMapTemp.Count);
-
-foreach (var (tag, postIds) in tagMapTemp)
-{
-    tagMap[tag] = postIds.ToArray();
-}
-
 Span<RelatedPosts> allRelatedPosts = new RelatedPosts[postsCount];
-Span<byte> taggedPostCount = stackalloc byte[postsCount];
 Span<(byte Count, int PostId)> top5 = stackalloc (byte Count, int PostId)[topN];
 
 for (var i = 0; i < postsCount; i++)
 {
-    taggedPostCount.Clear();  // reset counts
-
-    foreach (var tag in posts[i].Tags)
-    {
-        foreach (var otherPostIdx in tagMap[tag])
-        {
-            taggedPostCount[otherPostIdx]++;
-        }
-    }
-
-    taggedPostCount[i] = 0;  // Don't count self
+    uint tagMask = postTagMasks[i];
     top5.Clear();
     byte minTags = 0;
 
-    //  custom priority queue to find top N
-    for (var j = 0; j < postsCount; j++)
+    // custom priority queue to find top N
+    // two loops are used to avoid post including its own index
+    for (var j = 0; j < i; j++)
     {
-        byte count = taggedPostCount[j];
+        // us population count to compare how many tags are in common
+        byte count = (byte)BitOperations.PopCount(tagMask & postTagMasks[j]);
+
+        if (count > minTags)
+        {
+            int upperBound = topN - 2;
+
+            while (upperBound >= 0 && count > top5[upperBound].Count)
+            {
+                top5[upperBound + 1] = top5[upperBound];
+                upperBound--;
+            }
+
+            top5[upperBound + 1] = (count, j);
+
+            minTags = top5[topN - 1].Count;
+        }
+    }
+    
+    for (var j = i+1; j < postsCount; j++)
+    {
+        byte count = (byte)BitOperations.PopCount(tagMask & postTagMasks[j]);
 
         if (count > minTags)
         {
